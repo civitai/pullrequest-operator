@@ -2,11 +2,14 @@ package v1alpha1
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 
 	githubClient "github.com/google/go-github/v42/github"
@@ -112,6 +115,23 @@ func (githubPoller GithubPoller) Poll(branch string, etag string) (pullrequestv1
 		var tempBranch pullrequestv1alpha1.Branch
 		tempBranch.Name = prList[i].GetHead().GetRef()
 		tempBranch.Commit = prList[i].GetHead().GetSHA()
+		// civitai fork: fold the PR label set into the Commit discriminator so a
+		// label-only change retriggers the pipeline. Upstream keys event-detection
+		// and PipelineRun de-dup solely on Commit, and Branch.Equals ignores
+		// Details (where labels live), so without this a label add/remove produces
+		// no status diff and nothing fires. Suffix is appended ONLY when labels are
+		// present, so unlabeled PRs keep the bare SHA (backward compatible). The
+		// real SHA still flows untouched through Details ($.head.sha), which is what
+		// our PipelineTriggers read for PR_SHA.
+		if len(prList[i].Labels) > 0 {
+			names := make([]string, 0, len(prList[i].Labels))
+			for _, l := range prList[i].Labels {
+				names = append(names, l.GetName())
+			}
+			sort.Strings(names) // order-independent: GitHub label reordering must not refire
+			sum := sha256.Sum256([]byte(strings.Join(names, ",")))
+			tempBranch.Commit = tempBranch.Commit + "-" + hex.EncodeToString(sum[:])[:12]
+		}
 		pr, err := json.Marshal(prList[i])
 		if err != nil {
 			//fmt.Println(err)
