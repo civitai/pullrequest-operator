@@ -11,3 +11,6 @@ jobs:
       - run: go build ./...
       # pkg/... only — controllers/suite_test.go needs envtest (KUBEBUILDER_ASSETS)
       - run: go test ./pkg/... -v
+      # controllers: only the pure helper test (no envtest needed); the ginkgo
+      # TestAPIs suite is left to envtest and excluded here.
+      - run: go test ./controllers/... -run TestNextSourceBranches -v
