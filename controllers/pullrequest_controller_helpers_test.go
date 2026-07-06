@@ -86,4 +86,56 @@ func TestNextSourceBranches(t *testing.T) {
 	if len(added3) != 0 {
 		t.Fatalf("remove: newlyAdded=%v, want none (no genuinely-new PR)", names(added3))
 	}
+	current = store3
+
+	// Reconcile 4: an idempotent poll — the SAME open-PR set comes back. Store
+	// must remain the full set and NO PR must be reported as new (no spurious
+	// events on a steady-state poll).
+	polled4 := branchesOf("a", "b")
+	store4, added4 := nextSourceBranches(current, polled4)
+	if got, want := names(store4.Branches), []string{"a", "b"}; !equalStringSets(got, want) {
+		t.Fatalf("no-change: stored=%v, want FULL list %v", got, want)
+	}
+	if len(added4) != 0 {
+		t.Fatalf("no-change: newlyAdded=%v, want none on a steady-state poll", names(added4))
+	}
+}
+
+// branchWithCommit builds a single-branch Branches where Name and Commit are set
+// independently — needed to model a label change that alters ONLY the commit
+// discriminator on an otherwise-unchanged branch.
+func branchWithCommit(name, commit string) pipelinev1alpha1.Branches {
+	return pipelinev1alpha1.Branches{Branches: []pipelinev1alpha1.Branch{{Name: name, Commit: commit}}}
+}
+
+// TestNextSourceBranchesLabelChangeSameBranch models the label-retrigger core at
+// the store-decision layer: a PR on branch "feat/x" gets a label, so its Commit
+// discriminator changes from "<sha>" to "<sha>-<labelhash>" while the branch Name
+// stays the same. The store must become the FULL new set (the new discriminator),
+// and the branch must be reported as newly-added so the downstream consumer
+// refires the build for the new label state — while a NON-change poll must report
+// nothing (no spurious retrigger).
+func TestNextSourceBranchesLabelChangeSameBranch(t *testing.T) {
+	current := branchWithCommit("feat/x", "sha")
+
+	// Label added -> commit discriminator changes -> appears newly-added.
+	polled := branchWithCommit("feat/x", "sha-labelhash")
+	store, added := nextSourceBranches(current, polled)
+	if len(store.Branches) != 1 || store.Branches[0].Commit != "sha-labelhash" {
+		t.Fatalf("label change: store=%v, want the new discriminator sha-labelhash", store.Branches)
+	}
+	if len(added) != 1 || added[0].Name != "feat/x" || added[0].Commit != "sha-labelhash" {
+		t.Fatalf("label change: newlyAdded=%v, want feat/x@sha-labelhash (retrigger)", added)
+	}
+	current = store
+
+	// Poll again with the SAME discriminator -> no retrigger.
+	polledSame := branchWithCommit("feat/x", "sha-labelhash")
+	storeSame, addedSame := nextSourceBranches(current, polledSame)
+	if len(storeSame.Branches) != 1 || storeSame.Branches[0].Commit != "sha-labelhash" {
+		t.Fatalf("stable: store=%v, want unchanged discriminator", storeSame.Branches)
+	}
+	if len(addedSame) != 0 {
+		t.Fatalf("stable: newlyAdded=%v, want none (no spurious retrigger)", names(addedSame))
+	}
 }
