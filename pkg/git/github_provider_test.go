@@ -144,3 +144,59 @@ func TestPollPaginatesAllOpenPRs(t *testing.T) {
 		t.Fatalf("branch-c should be composite, got %q", got["branch-c"])
 	}
 }
+
+// TestPollNotModified304 covers the conditional-request short-circuit: when the
+// GitHub API responds 304 Not Modified on page 1, Poll must return the parsed
+// ETag, an EMPTY branch set, and no error — never a partial/empty status write.
+// This is the provider-layer churn guard (its Reconcile-layer sibling early-
+// returns when the ETag is unchanged). Without it, an unchanged repo would still
+// be re-diffed and re-written each interval.
+func TestPollNotModified304(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/pulls") {
+			http.Error(w, "unexpected path "+r.URL.Path, http.StatusNotFound)
+			return
+		}
+		hits++
+		w.Header().Set("ETag", `W/"abc123"`)
+		// Respond 304 regardless of If-None-Match so the test is deterministic.
+		w.WriteHeader(http.StatusNotModified)
+	}))
+	defer srv.Close()
+
+	poller := NewGithubPoller(srv.URL, "", false, "o", "r")
+	branches, etag, err := poller.Poll("main", `"abc123"`)
+	if err != nil {
+		t.Fatalf("Poll on 304 should not error, got %v", err)
+	}
+	if etag != `"abc123"` {
+		t.Fatalf("Poll 304 etag = %q, want %q (parsed from weak W/ tag)", etag, `"abc123"`)
+	}
+	if len(branches.Branches) != 0 {
+		t.Fatalf("Poll 304 should return no branches, got %v", branches.Branches)
+	}
+	if hits != 1 {
+		t.Fatalf("expected exactly one request (no pagination past a 304), got %d", hits)
+	}
+}
+
+// TestBranchFromPRLabelRetriggerContract is the explicit fork-behavior guard:
+// adding a label to a PR must change the Commit discriminator (so the change
+// propagates as a retrigger), while re-polling the identical PR must keep it
+// byte-stable (so nothing spuriously refires).
+func TestBranchFromPRLabelRetriggerContract(t *testing.T) {
+	const sha = "abcabcabcabcabcabcabcabcabcabcabcabcabca"
+
+	unlabeled, _ := branchFromPR(newPR("feat/x", sha, nil))
+	labeled, _ := branchFromPR(newPR("feat/x", sha, labels("preview")))
+	if unlabeled.Commit == labeled.Commit {
+		t.Fatalf("adding a label must change the commit discriminator: both %q", unlabeled.Commit)
+	}
+
+	// Same inputs -> byte-identical discriminator (no spurious retrigger).
+	labeledAgain, _ := branchFromPR(newPR("feat/x", sha, labels("preview")))
+	if labeled.Commit != labeledAgain.Commit {
+		t.Fatalf("identical PR produced different discriminators: %q vs %q", labeled.Commit, labeledAgain.Commit)
+	}
+}

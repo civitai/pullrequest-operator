@@ -64,6 +64,11 @@ type PullRequestReconciler struct {
 	Log      logr.Logger
 	Scheme   *runtime.Scheme
 	recorder record.EventRecorder
+	// newPoller builds the git poller for a PullRequest. It defaults to
+	// createGitPoller (a live GitHub/Bitbucket poller) and exists only as a test
+	// seam so Reconcile can be exercised with a fake poller without a network
+	// endpoint. It is never set in production.
+	newPoller func(*pipelinev1alpha1.PullRequest, string) gitApi.PullrequestPoller
 }
 
 //+kubebuilder:rbac:groups=pipeline.jquad.rocks,resources=pullrequests,verbs=get;list;watch;create;update;patch;delete
@@ -94,6 +99,12 @@ func (r *PullRequestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		Force:        pointer.Bool(true),
 	}
 
+	// newPoller defaults to the real createGitPoller; a test may inject a fake.
+	newPoller := r.newPoller
+	if newPoller == nil {
+		newPoller = createGitPoller
+	}
+
 	var prPoller gitApi.PullrequestPoller
 	// Credentials for Github/Bitbucket are provided
 	if len(pullrequest.Spec.GitProvider.SecretRef) > 0 {
@@ -107,9 +118,9 @@ func (r *PullRequestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			r.recorder.Event(&pullrequest, v1.EventTypeWarning, "Error", err.Error())
 			return r.ManageError(ctx, &pullrequest, req, err)
 		}
-		prPoller = createGitPoller(&pullrequest, string(foundSecret.Data[SECRET_ACCESSTOKEN_KEY]))
+		prPoller = newPoller(&pullrequest, string(foundSecret.Data[SECRET_ACCESSTOKEN_KEY]))
 	} else {
-		prPoller = createGitPoller(&pullrequest, "")
+		prPoller = newPoller(&pullrequest, "")
 	}
 
 	newBranches, eTag, err := prPoller.Poll(pullrequest.Spec.TargetBranch.Name, pullrequest.Status.ETag)
