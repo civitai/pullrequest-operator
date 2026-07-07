@@ -1,0 +1,15 @@
+name: test
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.19'
+      - run: go build ./...
+      # Full suite: api/v1alpha1 + pkg + controllers. The controllers tests use
+      # the controller-runtime fake client (no envtest); the Ginkgo TestAPIs
+      # suite has no specs, so it passes trivially without KUBEBUILDER_ASSETS.
+      - run: go test ./... -v

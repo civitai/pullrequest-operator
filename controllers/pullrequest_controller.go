@@ -64,6 +64,11 @@ type PullRequestReconciler struct {
 	Log      logr.Logger
 	Scheme   *runtime.Scheme
 	recorder record.EventRecorder
+	// newPoller builds the git poller for a PullRequest. It defaults to
+	// createGitPoller (a live GitHub/Bitbucket poller) and exists only as a test
+	// seam so Reconcile can be exercised with a fake poller without a network
+	// endpoint. It is never set in production.
+	newPoller func(*pipelinev1alpha1.PullRequest, string) gitApi.PullrequestPoller
 }
 
 //+kubebuilder:rbac:groups=pipeline.jquad.rocks,resources=pullrequests,verbs=get;list;watch;create;update;patch;delete
@@ -94,6 +99,12 @@ func (r *PullRequestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		Force:        pointer.Bool(true),
 	}
 
+	// newPoller defaults to the real createGitPoller; a test may inject a fake.
+	newPoller := r.newPoller
+	if newPoller == nil {
+		newPoller = createGitPoller
+	}
+
 	var prPoller gitApi.PullrequestPoller
 	// Credentials for Github/Bitbucket are provided
 	if len(pullrequest.Spec.GitProvider.SecretRef) > 0 {
@@ -107,9 +118,9 @@ func (r *PullRequestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			r.recorder.Event(&pullrequest, v1.EventTypeWarning, "Error", err.Error())
 			return r.ManageError(ctx, &pullrequest, req, err)
 		}
-		prPoller = createGitPoller(&pullrequest, string(foundSecret.Data[SECRET_ACCESSTOKEN_KEY]))
+		prPoller = newPoller(&pullrequest, string(foundSecret.Data[SECRET_ACCESSTOKEN_KEY]))
 	} else {
-		prPoller = createGitPoller(&pullrequest, "")
+		prPoller = newPoller(&pullrequest, "")
 	}
 
 	newBranches, eTag, err := prPoller.Poll(pullrequest.Spec.TargetBranch.Name, pullrequest.Status.ETag)
@@ -123,9 +134,9 @@ func (r *PullRequestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	if !pullrequest.Status.SourceBranches.Equals(newBranches) {
-		setDifferences := pullrequest.Status.SourceBranches.BranchSetDifference(newBranches)
-		for i := 0; i < len(setDifferences); i++ {
-			r.recorder.Event(&pullrequest, v1.EventTypeNormal, "Info", "New PR "+setDifferences[i].Name+"/"+setDifferences[i].Commit+" received.")
+		store, newlyAdded := nextSourceBranches(pullrequest.Status.SourceBranches, newBranches)
+		for i := 0; i < len(newlyAdded); i++ {
+			r.recorder.Event(&pullrequest, v1.EventTypeNormal, "Info", "New PR "+newlyAdded[i].Name+"/"+newlyAdded[i].Commit+" received.")
 		}
 		condition := metav1.Condition{
 			Type:               ReconcileSuccess,
@@ -137,12 +148,31 @@ func (r *PullRequestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 		pullrequest.AddOrReplaceCondition(condition)
 		pullrequest.Status.ETag = eTag
-		pullrequest.Status.SourceBranches.Branches = setDifferences
+		pullrequest.Status.SourceBranches.Branches = store.Branches
 		patch.UnstructuredContent()["status"] = pullrequest.Status
 		r.Status().Patch(ctx, patch, client.Apply, patchOptions)
 	}
 
 	return ctrl.Result{RequeueAfter: pullrequest.Spec.Interval.Duration}, nil
+}
+
+// nextSourceBranches computes the next authoritative Status.SourceBranches state
+// and the set of newly-added branches, given the currently-stored branches
+// (current) and the freshly-polled FULL open-PR set (polled).
+//
+// The stored state is ALWAYS the full polled list: Status.SourceBranches is the
+// authoritative complete open-PR set that the downstream consumer
+// (pipeline-trigger-operator) reads. newlyAdded contains only the branches present
+// in polled but NOT in current, so events fire only for genuinely-new PRs.
+//
+// Storing only the delta (the historical bug) truncated SourceBranches to the
+// newly-added branches — empty when a PR closed — causing the downstream consumer
+// to rebuild every open PR and the next poll to re-diff against the truncated
+// state, churning endlessly. See production incident 2026-07-06.
+func nextSourceBranches(current, polled pipelinev1alpha1.Branches) (store pipelinev1alpha1.Branches, newlyAdded []pipelinev1alpha1.Branch) {
+	newlyAdded = current.BranchSetDifference(polled)
+	store = pipelinev1alpha1.Branches{Branches: polled.Branches}
+	return store, newlyAdded
 }
 
 // SetupWithManager sets up the controller with the Manager.

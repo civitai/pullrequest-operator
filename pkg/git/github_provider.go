@@ -2,11 +2,14 @@ package v1alpha1
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 
 	githubClient "github.com/google/go-github/v42/github"
@@ -85,44 +88,93 @@ func (githubPoller GithubPoller) Poll(branch string, etag string) (pullrequestv1
 		client = githubClient.NewClient(tc)
 	}
 
-	opts := githubClient.PullRequestListOptions{Base: branch}
+	opts := githubClient.PullRequestListOptions{
+		Base:        branch,
+		ListOptions: githubClient.ListOptions{PerPage: 100},
+	}
 
+	// Paginate through ALL open PRs targeting the base branch. Upstream issued a
+	// single List() (GitHub default per_page=30), silently ignoring every PR
+	// beyond the first page — those PRs got no previews/checks at all regardless
+	// of commits or labels. Walk every page so coverage is complete.
 	var prList []*githubClient.PullRequest
-	var prResponse *githubClient.Response
-	prList, prResponse, err := client.PullRequests.List(ctx, githubPoller.Owner, githubPoller.Repository, &opts)
-	eTagUnparsed := prResponse.Header.Get("ETag")
 	eTag := ""
-	if strings.Contains(eTagUnparsed, "W/") {
-		eTag = strings.Split(prResponse.Header.Get("ETag"), "/")[1]
-	} else {
-		eTag = prResponse.Header.Get("ETag")
-	}
-	if prResponse.StatusCode == http.StatusNotModified {
-		return branches, eTag, nil
-	}
-	if err != nil {
-		fmt.Println(prResponse)
-		fmt.Println(err)
-		return branches, "", err
-	}
-
-	sourceBranches := make([]pullrequestv1alpha1.Branch, len(prList))
-
-	for i := 0; i < len(prList); i++ {
-		var tempBranch pullrequestv1alpha1.Branch
-		tempBranch.Name = prList[i].GetHead().GetRef()
-		tempBranch.Commit = prList[i].GetHead().GetSHA()
-		pr, err := json.Marshal(prList[i])
-		if err != nil {
-			//fmt.Println(err)
-			return branches, "", err
+	for page := 1; ; {
+		pagePRs, prResponse, listErr := client.PullRequests.List(ctx, githubPoller.Owner, githubPoller.Repository, &opts)
+		if prResponse == nil {
+			return branches, "", listErr
 		}
-		tempBranch.Details = string(pr)
-		sourceBranches[i] = tempBranch
+		if page == 1 {
+			eTagUnparsed := prResponse.Header.Get("ETag")
+			if strings.Contains(eTagUnparsed, "W/") {
+				eTag = strings.Split(eTagUnparsed, "/")[1]
+			} else {
+				eTag = eTagUnparsed
+			}
+			// Conditional-request short-circuit: page 1 unchanged since last poll.
+			if prResponse.StatusCode == http.StatusNotModified {
+				return branches, eTag, nil
+			}
+		}
+		if listErr != nil {
+			fmt.Println(prResponse)
+			fmt.Println(listErr)
+			return branches, "", listErr
+		}
+		prList = append(prList, pagePRs...)
+		if prResponse.NextPage == 0 {
+			break
+		}
+		page = prResponse.NextPage
+		opts.Page = prResponse.NextPage
+	}
+
+	sourceBranches := make([]pullrequestv1alpha1.Branch, 0, len(prList))
+	for _, pr := range prList {
+		tempBranch, marshalErr := branchFromPR(pr)
+		if marshalErr != nil {
+			return branches, "", marshalErr
+		}
+		sourceBranches = append(sourceBranches, tempBranch)
 	}
 	branches.Branches = sourceBranches
 
 	return branches, eTag, nil
+}
+
+// labelCommitSuffix returns "-<12 hex>" derived from a hash of the sorted PR
+// label names, or "" when the PR has no labels. It is deterministic and
+// order-independent, so re-ordering labels on GitHub does not refire, but any
+// add/remove changes the suffix. Folding this into Branch.Commit is what makes
+// a label-only change retrigger the pipeline: Branch.Equals compares Commit but
+// not Details (where the labels otherwise live), so without it a label edit
+// produces no status diff and nothing downstream fires.
+func labelCommitSuffix(labels []*githubClient.Label) string {
+	if len(labels) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(labels))
+	for _, l := range labels {
+		names = append(names, l.GetName())
+	}
+	sort.Strings(names)
+	sum := sha256.Sum256([]byte(strings.Join(names, ",")))
+	return "-" + hex.EncodeToString(sum[:])[:12]
+}
+
+// branchFromPR maps a GitHub pull request to a Branch, folding the label set
+// into the Commit discriminator. Unlabeled PRs keep the bare head SHA (backward
+// compatible); the untouched SHA always remains available in Details.
+func branchFromPR(pr *githubClient.PullRequest) (pullrequestv1alpha1.Branch, error) {
+	var b pullrequestv1alpha1.Branch
+	b.Name = pr.GetHead().GetRef()
+	b.Commit = pr.GetHead().GetSHA() + labelCommitSuffix(pr.Labels)
+	details, err := json.Marshal(pr)
+	if err != nil {
+		return b, err
+	}
+	b.Details = string(details)
+	return b, nil
 }
 
 type transportHeaders struct {
