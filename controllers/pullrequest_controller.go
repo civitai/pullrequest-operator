@@ -18,6 +18,7 @@ package controllers
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	v1 "k8s.io/api/core/v1"
@@ -150,7 +151,17 @@ func (r *PullRequestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		pullrequest.Status.ETag = eTag
 		pullrequest.Status.SourceBranches.Branches = store.Branches
 		patch.UnstructuredContent()["status"] = pullrequest.Status
-		r.Status().Patch(ctx, patch, client.Apply, patchOptions)
+		warnIfStatusLarge(ctx, &pullrequest)
+		if err := r.Status().Patch(ctx, patch, client.Apply, patchOptions); err != nil {
+			// Previously this error was discarded, so a status write rejected by the
+			// API server (e.g. the object exceeding etcd's size limit) left the CR
+			// silently stale while new PRs/commits were still logged as received.
+			// Keep the interval requeue (the next poll re-diffs and retries the
+			// write), but make the failure visible.
+			log.FromContext(ctx).Error(err, "unable to update PullRequest status; new PRs/commits are NOT recorded",
+				"pullrequest", req.NamespacedName.String(), "branches", len(store.Branches))
+			r.recorder.Event(&pullrequest, v1.EventTypeWarning, "StatusUpdateFailed", err.Error())
+		}
 	}
 
 	return ctrl.Result{RequeueAfter: pullrequest.Spec.Interval.Duration}, nil
@@ -173,6 +184,26 @@ func nextSourceBranches(current, polled pipelinev1alpha1.Branches) (store pipeli
 	newlyAdded = current.BranchSetDifference(polled)
 	store = pipelinev1alpha1.Branches{Branches: polled.Branches}
 	return store, newlyAdded
+}
+
+// statusSizeWarnBytes is the serialized-status size above which Reconcile logs
+// an error before writing. etcd rejects objects over ~1.5 MiB by default, so
+// 1 MiB leaves headroom to notice growth before writes start failing.
+const statusSizeWarnBytes = 1 << 20
+
+// warnIfStatusLarge logs (does not block) when the serialized status exceeds
+// statusSizeWarnBytes. It returns the measured size for tests.
+func warnIfStatusLarge(ctx context.Context, pr *pipelinev1alpha1.PullRequest) int {
+	raw, err := json.Marshal(pr.Status)
+	if err != nil {
+		return 0
+	}
+	if len(raw) > statusSizeWarnBytes {
+		log.FromContext(ctx).Error(fmt.Errorf("status is %d bytes (warn threshold %d)", len(raw), statusSizeWarnBytes),
+			"PullRequest status is approaching the etcd object size limit",
+			"pullrequest", pr.Namespace+"/"+pr.Name, "branches", len(pr.Status.SourceBranches.Branches))
+	}
+	return len(raw)
 }
 
 // SetupWithManager sets up the controller with the Manager.

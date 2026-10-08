@@ -162,14 +162,113 @@ func labelCommitSuffix(labels []*githubClient.Label) string {
 	return "-" + hex.EncodeToString(sum[:])[:12]
 }
 
+// prDetails is the CONTRACT for what Branch.Details holds: a trimmed subset of
+// the GitHub pull-request object, NOT the full object.
+//
+// Why trimmed: every Branch (one per open PR) is stored in the PullRequest CR's
+// status, and the full GitHub PR JSON is ~20 KB per PR (the head/base repo
+// objects alone are ~6 KB each, plus body, user, _links, ...). With ~76 open
+// PRs the CR approached the etcd object size limit (~1.5 MiB), status writes
+// started failing, and downstream PipelineRuns stopped being created.
+//
+// Shape: every kept field uses the SAME JSON key, nesting and omitempty
+// semantics as go-github's PullRequest marshaling (the pointer fields are copied
+// straight from it), so an existing JSONPath such as "$.head.sha" resolves to
+// exactly the value it did before. Consumers (pipeline-trigger-operator's
+// PullRequest source) evaluate arbitrary PipelineTrigger param JSONPaths against
+// this string; a path naming a field NOT listed here evaluates to null there,
+// its param check fails ("Expression ... evaluates to null") and that PR gets an
+// Error condition and NO PipelineRun. So ADD the field here before using it in
+// a PipelineTrigger.
+//
+// Kept fields and who reads them:
+//   - number             PipelineTrigger params PR_NUMBER=$.number (all PR triggers)
+//   - head.sha           PipelineTrigger params PR_SHA / GIT_REVISION=$.head.sha; the
+//     real SHA when Branch.Commit carries the label suffix
+//   - author_association PipelineTrigger param AUTHOR_ASSOCIATION=$.author_association
+//     (the PR-preview triggers)
+//   - head.ref           Branch.Name source; upstream pipeline-trigger-operator
+//     sample trigger (ci/pipelinetrigger-pullrequest.yaml) reads $.head.ref
+//   - head.label         upstream sample (examples/create-pipeline-on-pr) reads $.head.label
+//   - statuses_url       upstream sample (ci/pipelinetrigger-pullrequest.yaml) reads it
+//   - title              documented in the pipeline-trigger-operator README ($.title)
+//   - labels[].name      the PR's label set (the same names labelCommitSuffix folds
+//     into Branch.Commit, which is computed from the PR, not from Details)
+//   - base.ref/base.sha, user.login, state, draft, html_url
+//     small identifying fields kept so a trigger can address the PR's target,
+//     author and URL without the full object.
+//
+// Deliberately dropped: body, head.repo/base.repo, user (beyond login),
+// _links, assignees, reviewers, milestone and every *_url except the two above.
+type prDetails struct {
+	Number            *int             `json:"number,omitempty"`
+	State             *string          `json:"state,omitempty"`
+	Title             *string          `json:"title,omitempty"`
+	Draft             *bool            `json:"draft,omitempty"`
+	AuthorAssociation *string          `json:"author_association,omitempty"`
+	HTMLURL           *string          `json:"html_url,omitempty"`
+	StatusesURL       *string          `json:"statuses_url,omitempty"`
+	User              *prUserDetails   `json:"user,omitempty"`
+	Labels            []prLabelDetails `json:"labels,omitempty"`
+	Head              *prBranchDetails `json:"head,omitempty"`
+	Base              *prBranchDetails `json:"base,omitempty"`
+}
+
+type prUserDetails struct {
+	Login *string `json:"login,omitempty"`
+}
+
+type prLabelDetails struct {
+	Name *string `json:"name,omitempty"`
+}
+
+type prBranchDetails struct {
+	Label *string `json:"label,omitempty"`
+	Ref   *string `json:"ref,omitempty"`
+	SHA   *string `json:"sha,omitempty"`
+}
+
+func trimBranch(b *githubClient.PullRequestBranch) *prBranchDetails {
+	if b == nil {
+		return nil
+	}
+	return &prBranchDetails{Label: b.Label, Ref: b.Ref, SHA: b.SHA}
+}
+
+// trimPR projects a GitHub pull request onto the prDetails contract.
+func trimPR(pr *githubClient.PullRequest) prDetails {
+	d := prDetails{
+		Number:            pr.Number,
+		State:             pr.State,
+		Title:             pr.Title,
+		Draft:             pr.Draft,
+		AuthorAssociation: pr.AuthorAssociation,
+		HTMLURL:           pr.HTMLURL,
+		StatusesURL:       pr.StatusesURL,
+		Head:              trimBranch(pr.Head),
+		Base:              trimBranch(pr.Base),
+	}
+	if pr.User != nil {
+		d.User = &prUserDetails{Login: pr.User.Login}
+	}
+	for _, l := range pr.Labels {
+		if l == nil {
+			continue
+		}
+		d.Labels = append(d.Labels, prLabelDetails{Name: l.Name})
+	}
+	return d
+}
+
 // branchFromPR maps a GitHub pull request to a Branch, folding the label set
 // into the Commit discriminator. Unlabeled PRs keep the bare head SHA (backward
-// compatible); the untouched SHA always remains available in Details.
+// compatible); the untouched SHA always remains available in Details
+// ($.head.sha). Details holds the trimmed prDetails projection, not the full PR.
 func branchFromPR(pr *githubClient.PullRequest) (pullrequestv1alpha1.Branch, error) {
 	var b pullrequestv1alpha1.Branch
 	b.Name = pr.GetHead().GetRef()
 	b.Commit = pr.GetHead().GetSHA() + labelCommitSuffix(pr.Labels)
-	details, err := json.Marshal(pr)
+	details, err := json.Marshal(trimPR(pr))
 	if err != nil {
 		return b, err
 	}
