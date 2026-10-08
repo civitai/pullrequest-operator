@@ -150,9 +150,13 @@ func (r *PullRequestReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		pullrequest.AddOrReplaceCondition(condition)
 		pullrequest.Status.ETag = eTag
 		pullrequest.Status.SourceBranches.Branches = store.Branches
-		patch.UnstructuredContent()["status"] = pullrequest.Status
 		warnIfStatusLarge(ctx, &pullrequest)
-		if err := r.Status().Patch(ctx, patch, client.Apply, patchOptions); err != nil {
+		statusContent, err := statusApplyContent(pullrequest.Status)
+		if err == nil {
+			patch.UnstructuredContent()["status"] = statusContent
+			err = r.Status().Patch(ctx, patch, client.Apply, patchOptions)
+		}
+		if err != nil {
 			// Previously this error was discarded, so a status write rejected by the
 			// API server (e.g. the object exceeding etcd's size limit) left the CR
 			// silently stale while new PRs/commits were still logged as received.
@@ -184,6 +188,39 @@ func nextSourceBranches(current, polled pipelinev1alpha1.Branches) (store pipeli
 	newlyAdded = current.BranchSetDifference(polled)
 	store = pipelinev1alpha1.Branches{Branches: polled.Branches}
 	return store, newlyAdded
+}
+
+// statusApplyContent renders status as the server-side-apply body for the status
+// subresource, always carrying sourceBranches.branches as an explicit array —
+// empty ([]) when the poll found no open PRs.
+//
+// Branches.Branches is `omitempty`, so an empty poll serialises as
+// `"sourceBranches":{}`. When this field manager already owns
+// sourceBranches.branches (any earlier successful write), the API server's
+// server-side apply of that empty object yields sourceBranches = null, which
+// the CRD schema (type: object) rejects: `status.sourceBranches: Invalid value:
+// "null"`. The whole status write then fails and the CR keeps its last
+// non-empty branch list forever. An explicit `"branches": []` is accepted and
+// stored as {"branches": []}. (Reproduced against kube-apiserver 1.33 via
+// envtest — see TestEmptyStatusAppliesAgainstRealAPIServer.)
+func statusApplyContent(status pipelinev1alpha1.PullRequestStatus) (map[string]interface{}, error) {
+	raw, err := json.Marshal(status)
+	if err != nil {
+		return nil, err
+	}
+	content := map[string]interface{}{}
+	if err := json.Unmarshal(raw, &content); err != nil {
+		return nil, err
+	}
+	sb, _ := content["sourceBranches"].(map[string]interface{})
+	if sb == nil {
+		sb = map[string]interface{}{}
+		content["sourceBranches"] = sb
+	}
+	if _, ok := sb["branches"]; !ok {
+		sb["branches"] = []interface{}{}
+	}
+	return content, nil
 }
 
 // statusSizeWarnBytes is the serialized-status size above which Reconcile logs
